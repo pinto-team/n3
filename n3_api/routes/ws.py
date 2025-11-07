@@ -1,12 +1,13 @@
 # noema/n3_api/routes/ws.py
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from contextlib import asynccontextmanager
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from contextlib import asynccontextmanager
 import asyncio
+import json
+from contextlib import asynccontextmanager
+
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+
+from n3_api.utils.drivers import build_drivers_safe
 from n3_api.utils.state import ensure_state, update_state
 from n3_runtime.loop.io_tick import run_tick_io
-from n3_api.utils.drivers import build_drivers_safe
 
 def _build_drivers_safe():
     """Build drivers and FORCE the required shape for run_tick_io and WS:
@@ -129,10 +130,22 @@ async def ws_chat(ws: WebSocket, thread_id: str):
             state = run_tick_io(state, _DRIVERS)
 
             items = (((state.get("executor") or {}).get("results") or {}).get("items") or [])
-            hits = []
-            if items and isinstance(items[0].get("data"), dict):
-                hits = items[0]["data"].get("hits", [])
-            answer = (hits[0].get("snippet") if hits else f'{{"echo": "{text}"}}') or "..."
+            answer = ""
+            for item in items:
+                if item.get("req_id") != "r-chat":
+                    continue
+                data = item.get("data") if isinstance(item.get("data"), dict) else {}
+                hits = data.get("hits") if isinstance(data.get("hits"), list) else []
+                if not hits:
+                    continue
+                top = hits[0] if isinstance(hits[0], dict) else {}
+                answer = top.get("snippet") or top.get("text") or ""
+                if not answer:
+                    answer = json.dumps(top, ensure_ascii=False)
+                break
+
+            if not answer:
+                answer = json.dumps({"echo": text}, ensure_ascii=False)
 
             # Phase 2: finalize and emit
             state.setdefault("executor", {})["requests"] = []
