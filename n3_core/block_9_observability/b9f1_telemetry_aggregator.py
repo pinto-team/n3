@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import statistics
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -113,7 +114,52 @@ def _collect_world(inp: Dict[str, Any]) -> Dict[str, Any]:
     top = _get(inp, ["world_model", "prediction", "top"], "")
     sa = _get(inp, ["world_model", "context", "features", "speech_act"], "")
     u = _get(inp, ["world_model", "uncertainty", "score"], 0.0)
-    return {"reply_top": top, "speech_act": sa, "uncertainty": float(u)}
+    hist = _get(inp, ["world_model", "trace", "prediction_history"], []) or []
+    err_hist = _get(inp, ["world_model", "trace", "error_history"], []) or []
+    probs = [float(item.get("top_prob", 0.0)) for item in hist[-5:] if isinstance(item, dict)]
+    rewards = [float(item.get("reward", 0.0)) for item in err_hist[-5:] if isinstance(item, dict)]
+    trend = probs[-1] - probs[0] if len(probs) >= 2 else 0.0
+    reward_avg = statistics.fmean(rewards) if rewards else 0.0
+    return {"reply_top": top, "speech_act": sa, "uncertainty": float(u),
+            "prob_trend": trend, "reward_avg": reward_avg}
+
+
+def _collect_adaptation(inp: Dict[str, Any]) -> Dict[str, Any]:
+    adap = _get(inp, ["adaptation", "policy"], {}) or {}
+    learning = _get(inp, ["policy", "learning"], {}) or {}
+    version = learning.get("version", {}) if isinstance(learning.get("version"), dict) else {}
+    return {
+        "updates": int(adap.get("updates", 0)),
+        "avg_reward": float(adap.get("avg_reward", 0.0)),
+        "confidence": float(adap.get("confidence", 0.0)),
+        "delta_norm": float(adap.get("delta_norm", 0.0)),
+        "version": version.get("id"),
+    }
+
+
+def _collect_concept(inp: Dict[str, Any]) -> Dict[str, Any]:
+    cg = _get(inp, ["concept_graph"], {}) or {}
+    updates = cg.get("updates") if isinstance(cg.get("updates"), dict) else {}
+    version = cg.get("version") if isinstance(cg.get("version"), dict) else {}
+    return {
+        "new_rules": int(updates.get("new_rules", 0)),
+        "assoc": int(updates.get("assoc", 0)),
+        "synonym": int(updates.get("synonym", 0)),
+        "subsumes": int(updates.get("subsumes", 0)),
+        "version": version.get("id"),
+    }
+
+
+def _reasoning_time_ms(inp: Dict[str, Any], agg: Dict[str, Any], best: Dict[str, Any]) -> float:
+    if isinstance(best, dict) and isinstance(best.get("duration_ms"), (int, float)):
+        return float(best["duration_ms"])
+    if isinstance(agg, dict) and isinstance(agg.get("avg_latency_ms"), (int, float)):
+        return float(agg["avg_latency_ms"])
+    start = _get(inp, ["clock", "tick_start_ms"], None)
+    now = _get(inp, ["clock", "now_ms"], None)
+    if isinstance(start, (int, float)) and isinstance(now, (int, float)):
+        return float(max(0, now - start))
+    return 0.0
 
 
 def _session(inp: Dict[str, Any]) -> Dict[str, Any]:
@@ -134,6 +180,8 @@ def b9f1_aggregate_telemetry(input_json: Dict[str, Any]) -> Dict[str, Any]:
     agg, best = _collect_exec(input_json)
     wal, apply_ops, index_items = _collect_persist(input_json)
     world = _collect_world(input_json)
+    adaptation = _collect_adaptation(input_json)
+    concept = _collect_concept(input_json)
 
     metrics: List[Dict[str, Any]] = []
     audit: List[Dict[str, Any]] = []
@@ -144,6 +192,10 @@ def b9f1_aggregate_telemetry(input_json: Dict[str, Any]) -> Dict[str, Any]:
     # Metrics: plan
     metrics.append(_metric("plan_must_confirm", 1.0 if plan["must_confirm"] else 0.0,
                            {**sess, "next_move": plan.get("next_move") or "unknown"}))
+
+    reasoning_ms = _reasoning_time_ms(input_json, agg, best)
+    if reasoning_ms:
+        metrics.append(_metric("reasoning_time_ms", reasoning_ms, {**sess}))
 
     # Metrics: execution aggregate
     if agg:
@@ -178,6 +230,29 @@ def b9f1_aggregate_telemetry(input_json: Dict[str, Any]) -> Dict[str, Any]:
         metrics.append(_metric("wm_uncertainty", world.get("uncertainty", 0.0),
                                {**sess, "reply_top": world.get("reply_top") or "",
                                 "speech_act": world.get("speech_act") or ""}))
+        metrics.append(_metric("wm_prob_trend", world.get("prob_trend", 0.0), {**sess}))
+        metrics.append(_metric("wm_reward_avg", world.get("reward_avg", 0.0), {**sess}))
+
+    if adaptation:
+        metrics.append(_metric("policy_updates", float(adaptation.get("updates", 0)), {**sess}))
+        metrics.append(_metric("policy_avg_reward", adaptation.get("avg_reward", 0.0), {**sess}))
+        metrics.append(_metric("policy_confidence", adaptation.get("confidence", 0.0), {**sess}))
+
+    if concept:
+        metrics.append(_metric("concept_new_rules", float(concept.get("new_rules", 0)), {**sess}))
+        metrics.append(_metric("concept_assoc_rules", float(concept.get("assoc", 0)), {**sess}))
+
+    summary = {
+        "success": int(agg.get("ok", 0)) if isinstance(agg, dict) else 0,
+        "failures": int(agg.get("errors", 0)) if isinstance(agg, dict) else 0,
+        "uncertainty": world.get("uncertainty", 0.0) if world else 0.0,
+        "prob_trend": world.get("prob_trend", 0.0) if world else 0.0,
+        "reward_avg": world.get("reward_avg", 0.0) if world else 0.0,
+        "policy_updates": adaptation.get("updates", 0),
+        "policy_avg_reward": adaptation.get("avg_reward", 0.0),
+        "concept_new_rules": concept.get("new_rules", 0),
+    }
+    summary["needs_introspection"] = bool(summary["uncertainty"] >= 0.65 or summary["prob_trend"] < -0.1)
 
     # Audit events (capped)
     if plan.get("skill_id") or plan.get("skill_name"):
@@ -225,6 +300,7 @@ def b9f1_aggregate_telemetry(input_json: Dict[str, Any]) -> Dict[str, Any]:
             "telemetry": {
                 "metrics": metrics,
                 "audit": audit,
+                "summary": summary,
                 "meta": {"source": "B9F1", "rules_version": RULES_VERSION}
             }
         },

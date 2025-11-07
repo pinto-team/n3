@@ -6,11 +6,14 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional, Set
 
+import hashlib
+import json
+from datetime import datetime, timezone
 import unicodedata
 
 __all__ = ["b4f4_extract_rules"]
 
-RULES_VERSION = "1.0"
+RULES_VERSION = "1.1"
 
 # Limits & thresholds
 MAX_RULES_OUT = 1200
@@ -76,6 +79,15 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
     return float(x) if isinstance(x, (int, float)) else default
 
 
+def _now_z() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _hash(obj: Any) -> str:
+    payload = json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
 # ------------------------- collectors -------------------------
 
 def _get_nodes(inp: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -103,16 +115,19 @@ def _rule_assoc(u: Dict[str, Any], v: Dict[str, Any], e: Dict[str, Any]) -> Opti
     if w < THRESH_ASSOC_W:
         return None
     labels = e.get("labels") or []
+    reward = _safe_float(e.get("reward_avg"), 0.0)
+    conf = min(1.0, 0.5 * w + 0.2 * _safe_float(e.get("components", {}).get("pmi_n"), 0.0) + 0.3 * reward)
     return {
         "type": "assoc",
         "u": u.get("id"),
         "v": v.get("id"),
-        "confidence": round(min(1.0, 0.7 * w + 0.3 * _safe_float(e.get("components", {}).get("pmi_n"), 0.0)), 6),
+        "confidence": round(conf, 6),
         "evidence": {
             "edge_w": round(w, 6),
             "pmi": _safe_float(e.get("pmi"), 0.0),
             "cooc": int(e.get("cooc", 0)),
             "labels": list(labels)[:MAX_LABELS_PER_RULE],
+            "reward_avg": round(reward, 6),
         },
         "meta": {"source": "B4F4", "rules_version": RULES_VERSION}
     }
@@ -261,13 +276,41 @@ def b4f4_extract_rules(input_json: Dict[str, Any]) -> Dict[str, Any]:
         if len(out_rules) >= MAX_RULES_OUT:
             break
 
+    cg_prev = input_json.get("concept_graph", {}) if isinstance(input_json.get("concept_graph"), dict) else {}
+    prev_version = None
+    if isinstance(cg_prev.get("version"), dict):
+        prev_version = cg_prev["version"].get("id")
+
+    version_payload = {
+        "parent": prev_version,
+        "rules": out_rules[:MAX_RULES_OUT],
+        "node_ids": sorted([n.get("id") for n in nodes if isinstance(n.get("id"), str)])[:120],
+        "edge_pairs": sorted([(e.get("u"), e.get("v")) for e in edges if isinstance(e.get("u"), str) and isinstance(e.get("v"), str)])[:200],
+    }
+    version_doc = {
+        "id": _hash(version_payload),
+        "parent_id": prev_version,
+        "updated_at": _now_z(),
+        "counts": {"rules": len(out_rules[:MAX_RULES_OUT]), "edges": len(edges), "nodes": len(nodes)},
+        "meta": {"source": "B4F4", "rules_version": RULES_VERSION},
+    }
+
+    updates = {
+        "new_rules": len(out_rules[:MAX_RULES_OUT]),
+        "assoc": c_assoc,
+        "synonym": c_syn,
+        "subsumes": c_sub,
+    }
+
     return {
         "status": "OK",
         "concept_graph": {
             "rules": {
                 "rules": out_rules[:MAX_RULES_OUT],
                 "meta": {"source": "B4F4", "rules_version": RULES_VERSION},
-            }
+            },
+            "version": version_doc,
+            "updates": updates,
         },
         "diag": {
             "reason": "ok",

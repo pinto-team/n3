@@ -6,13 +6,13 @@ from __future__ import annotations
 import math
 import re
 from collections import defaultdict
-from typing import Any, Dict, List, Tuple, Iterable
+from typing import Any, Dict, List, Tuple, Iterable, Optional
 
 import unicodedata
 
 __all__ = ["b4f1_mine_patterns"]
 
-RULES_VERSION = "1.0"
+RULES_VERSION = "1.1"
 
 # ----------------------------- limits -----------------------------
 MAX_DOCS = 12
@@ -21,6 +21,8 @@ MAX_EDGES_OUT = 1000
 MAX_SURFACES = 3
 NGRAM_MAX_N = 3
 WINDOW_SIZE = 6
+INTENT_PREFIX = "intent::"
+TRACE_EDGE_WEIGHT = 0.8
 
 # ----------------------------- regex & stops -----------------------------
 RE_WS = re.compile(r"\s+", re.UNICODE)
@@ -55,6 +57,101 @@ def _is_word_like(tok: str) -> bool:
 
 def _is_stop(tok_cf: str) -> bool:
     return tok_cf in EN_STOPS or tok_cf in FA_STOPS
+
+
+# ----------------------------- trace helpers -----------------------------
+
+def _intent_key(label: Optional[str]) -> str:
+    label = (label or "other").strip()
+    if not label:
+        label = "other"
+    return f"{INTENT_PREFIX}{label}"
+
+
+def _intent_surface(label: str) -> str:
+    return f"Policy intent — {label.replace('_', ' ')}"
+
+
+def _collect_trace(inp: Dict[str, Any]) -> List[Dict[str, Any]]:
+    wm = inp.get("world_model", {}) if isinstance(inp.get("world_model"), dict) else {}
+    trace = wm.get("trace", {}) if isinstance(wm.get("trace"), dict) else {}
+    hist = trace.get("error_history") if isinstance(trace.get("error_history"), list) else []
+    out: List[Dict[str, Any]] = []
+    for item in hist:
+        if not isinstance(item, dict):
+            continue
+        reward = item.get("reward")
+        if not isinstance(reward, (int, float)):
+            continue
+        target = item.get("target") if isinstance(item.get("target"), str) else None
+        actual = item.get("actual") if isinstance(item.get("actual"), str) else None
+        top_pred = item.get("top_pred") if isinstance(item.get("top_pred"), str) else None
+        if not target and not actual and not top_pred:
+            continue
+        out.append({
+            "reward": float(reward),
+            "target": target or top_pred or "other",
+            "actual": actual or top_pred or target or "other",
+            "top_pred": top_pred or target or actual or "other",
+        })
+    return out
+
+
+def _trace_terms(trace: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    counts: Dict[str, int] = {}
+    for item in trace:
+        for label in {item.get("target"), item.get("actual"), item.get("top_pred")}:
+            if isinstance(label, str) and label:
+                key = _intent_key(label)
+                counts[key] = counts.get(key, 0) + 1
+    terms: List[Dict[str, Any]] = []
+    for key, tf in counts.items():
+        label = key.split("::", 1)[-1]
+        terms.append({
+            "key": key,
+            "tf": tf,
+            "df": max(1, tf // 2 + 1),
+            "surfaces": [_intent_surface(label)],
+        })
+    return terms
+
+
+def _trace_edges(trace: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    agg: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for item in trace:
+        reward = float(item.get("reward", 0.0))
+        target = _intent_key(item.get("target"))
+        actual = _intent_key(item.get("actual"))
+        top_pred = _intent_key(item.get("top_pred"))
+
+        for a, b, weight in ((target, actual, 1.0), (target, top_pred, TRACE_EDGE_WEIGHT)):
+            if a == b:
+                continue
+            key = tuple(sorted((a, b)))
+            bucket = agg.get(key)
+            if not bucket:
+                bucket = {"a": key[0], "b": key[1], "cooc": 0, "reward_sum": 0.0, "reward_sq": 0.0}
+                agg[key] = bucket
+            bucket["cooc"] += 1
+            bucket["reward_sum"] += reward * weight
+            bucket["reward_sq"] += (reward * weight) ** 2
+
+    edges: List[Dict[str, Any]] = []
+    for data in agg.values():
+        cooc = max(1, int(data["cooc"]))
+        reward_avg = data["reward_sum"] / cooc
+        reward_var = max(0.0, data["reward_sq"] / cooc - reward_avg ** 2)
+        pmi_like = reward_avg * math.log1p(cooc)
+        edges.append({
+            "a": data["a"],
+            "b": data["b"],
+            "cooc": cooc,
+            "pmi": round(pmi_like, 6),
+            "reward_avg": round(reward_avg, 6),
+            "reward_var": round(reward_var, 6),
+            "labels": [f"{data['a']} ↔ {data['b']}"]
+        })
+    return edges
 
 
 # ----------------------------- input collectors -----------------------------
@@ -263,12 +360,14 @@ def b4f1_mine_patterns(input_json: Dict[str, Any]) -> Dict[str, Any]:
       }
     """
     docs = _as_packz_list(input_json)
-    if not docs:
+    trace = _collect_trace(input_json)
+    if not docs and not trace:
         return {
             "status": "SKIP",
             "concept_graph": {
-                "patterns": {"terms": [], "edges": [], "meta": {"source": "B4F1", "rules_version": RULES_VERSION}}},
-            "diag": {"reason": "no_docs", "counts": {"docs": 0, "terms": 0, "pairs": 0}},
+                "patterns": {"terms": [], "edges": [],
+                               "meta": {"source": "B4F1", "rules_version": RULES_VERSION, "docs": 0, "trace_samples": 0}}},
+            "diag": {"reason": "no_docs", "counts": {"docs": 0, "terms": 0, "pairs": 0, "trace_samples": 0}},
         }
 
     corpus_term_tf: Dict[str, int] = {}
@@ -306,18 +405,36 @@ def b4f1_mine_patterns(input_json: Dict[str, Any]) -> Dict[str, Any]:
         for (a, b), c in edges_sorted[:MAX_EDGES_OUT]
     ]
 
+    if trace:
+        terms_out.extend(_trace_terms(trace))
+        edges_out.extend(_trace_edges(trace))
+
+    terms_out = sorted(terms_out, key=lambda t: (-int(t.get("tf", 0)), -int(t.get("df", 0))))[:MAX_TERMS_OUT]
+
+    edges_out = sorted(edges_out, key=lambda e: (-e.get("cooc", 0), -e.get("reward_avg", 0.0), -e.get("pmi", 0.0)))[:MAX_EDGES_OUT]
+
     return {
         "status": "OK",
         "concept_graph": {
             "patterns": {
                 "terms": terms_out,
                 "edges": edges_out,
-                "meta": {"source": "B4F1", "rules_version": RULES_VERSION},
+                "meta": {
+                    "source": "B4F1",
+                    "rules_version": RULES_VERSION,
+                    "docs": len(docs),
+                    "trace_samples": len(trace),
+                },
             }
         },
         "diag": {
             "reason": "ok",
-            "counts": {"docs": len(docs), "terms": len(terms_out), "pairs": len(edges_out)},
+            "counts": {
+                "docs": len(docs),
+                "terms": len(terms_out),
+                "pairs": len(edges_out),
+                "trace_samples": len(trace),
+            },
         },
     }
 

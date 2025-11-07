@@ -117,6 +117,17 @@ def _plan_meta(inp: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _concept_snapshot(inp: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    cg = _get(inp, ["concept_graph"], {})
+    if not isinstance(cg, dict):
+        return None
+    version = cg.get("version") if isinstance(cg.get("version"), dict) else None
+    if not version or not isinstance(version.get("id"), str):
+        return None
+    updates = cg.get("updates") if isinstance(cg.get("updates"), dict) else {}
+    return {"version": version, "updates": updates}
+
+
 # ------------------------- main -------------------------
 
 def b8f1_memory_commit(input_json: Dict[str, Any]) -> Dict[str, Any]:
@@ -150,6 +161,7 @@ def b8f1_memory_commit(input_json: Dict[str, Any]) -> Dict[str, Any]:
     as_text, as_move, as_lang, as_dir = _collect_assistant(input_json)
     result_best = _collect_result_summary(input_json)
     plan_meta = _plan_meta(input_json)
+    concept_snap = _concept_snapshot(input_json)
 
     ops: List[Dict[str, Any]] = []
 
@@ -215,6 +227,14 @@ def b8f1_memory_commit(input_json: Dict[str, Any]) -> Dict[str, Any]:
     if result_best:
         counters["executions"] = 1
     ops.append({"op": "bump_counters", "keys": counters})
+
+    if concept_snap:
+        ops.append({
+            "op": "record_concept_version",
+            "version": concept_snap["version"].get("id"),
+            "doc": concept_snap["version"],
+            "updates": concept_snap.get("updates", {}),
+        })
 
     return {
         "status": "OK",

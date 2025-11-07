@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -10,7 +12,20 @@ import unicodedata
 
 __all__ = ["b10f1_plan_policy_delta"]
 
-RULES_VERSION = "1.0"
+RULES_VERSION = "1.1"
+LEARNING_LABELS = [
+    "direct_answer",
+    "execute_action",
+    "ask_clarification",
+    "acknowledge_only",
+    "small_talk",
+    "closing",
+    "refuse_or_safecheck",
+    "other",
+]
+TRACE_CONSIDER = 12
+LEARNING_RATE_BASE = 0.18
+CONFIDENCE_DECAY = 0.4
 
 
 # ------------------------- utils -------------------------
@@ -44,6 +59,164 @@ def _clip(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 
+def _sha1(obj: Any) -> str:
+    payload = json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def _deepcopy(obj: Any) -> Any:
+    return json.loads(json.dumps(obj, ensure_ascii=False))
+
+
+# ------------------------- learning collectors -------------------------
+
+def _collect_learning(inp: Dict[str, Any]) -> Dict[str, Any]:
+    pol = inp.get("policy", {}) if isinstance(inp.get("policy"), dict) else {}
+    learning = pol.get("learning", {}) if isinstance(pol.get("learning"), dict) else {}
+    weights = learning.get("weights") if isinstance(learning.get("weights"), dict) else {}
+    version = learning.get("version") if isinstance(learning.get("version"), dict) else {}
+    summary = learning.get("summary") if isinstance(learning.get("summary"), dict) else {}
+    rollback = learning.get("rollback") if isinstance(learning.get("rollback"), dict) else {}
+
+    base_weights = {label: float(weights.get(label, 0.5)) for label in LEARNING_LABELS}
+    return {
+        "weights": base_weights,
+        "version": {
+            "id": version.get("id"),
+            "parent_id": version.get("parent_id"),
+            "updated_at": version.get("updated_at"),
+        },
+        "summary": {
+            "avg_reward": float(summary.get("avg_reward", 0.0)),
+            "updates": int(summary.get("updates", 0)),
+            "confidence": float(summary.get("confidence", 0.5)),
+        },
+        "rollback": {
+            "version": rollback.get("version"),
+            "weights": {label: float(rollback.get("weights", {}).get(label, 0.5)) for label in LEARNING_LABELS},
+        },
+    }
+
+
+def _collect_trace(inp: Dict[str, Any]) -> List[Dict[str, Any]]:
+    wm = inp.get("world_model", {}) if isinstance(inp.get("world_model"), dict) else {}
+    trace = wm.get("trace", {}) if isinstance(wm.get("trace"), dict) else {}
+    history = trace.get("error_history") if isinstance(trace.get("error_history"), list) else []
+    out: List[Dict[str, Any]] = []
+    for item in history[-TRACE_CONSIDER:]:
+        if not isinstance(item, dict):
+            continue
+        reward = item.get("reward")
+        if not isinstance(reward, (int, float)):
+            continue
+        entry = {
+            "reward": float(reward),
+            "target": item.get("target"),
+            "actual": item.get("actual"),
+            "top_pred": item.get("top_pred"),
+            "l1": float(item.get("l1", 0.0)) if isinstance(item.get("l1"), (int, float)) else 0.0,
+            "kl": float(item.get("kl", 0.0)) if isinstance(item.get("kl"), (int, float)) else 0.0,
+            "speech_act": item.get("speech_act"),
+        }
+        out.append(entry)
+    return out
+
+
+def _collect_uncertainty(inp: Dict[str, Any]) -> float:
+    return _as_float(_get(inp, ["world_model", "uncertainty", "score"], 0.0), 0.0)
+
+
+# ------------------------- reinforcement learner -------------------------
+
+def _reinforce(weights: Dict[str, float], trace: List[Dict[str, Any]], uncertainty: float) -> Tuple[Dict[str, float], Dict[str, Any]]:
+    if not trace:
+        return weights, {
+            "avg_reward": 0.0,
+            "updates": 0,
+            "confidence": max(0.05, 1.0 - uncertainty),
+            "delta_norm": 0.0,
+        }
+
+    lr = LEARNING_RATE_BASE * (1.0 - 0.5 * uncertainty)
+    updated = _deepcopy(weights)
+    total_reward = 0.0
+    delta_norm = 0.0
+
+    for item in trace:
+        reward = float(item.get("reward", 0.0))
+        total_reward += reward
+        target = item.get("target") if isinstance(item.get("target"), str) else None
+        actual = item.get("actual") if isinstance(item.get("actual"), str) else None
+        top_pred = item.get("top_pred") if isinstance(item.get("top_pred"), str) else None
+
+        if target in updated:
+            delta = lr * reward
+            updated[target] = _clip(updated[target] + delta, 0.0, 1.5)
+            delta_norm += abs(delta)
+        if actual in updated:
+            delta = lr * (reward - 0.5)
+            updated[actual] = _clip(updated[actual] + delta, 0.0, 1.5)
+            delta_norm += abs(delta)
+        if top_pred and top_pred in updated and target and top_pred != target:
+            delta = -lr * (0.6 - reward)
+            updated[top_pred] = _clip(updated[top_pred] + delta, 0.0, 1.5)
+            delta_norm += abs(delta)
+
+    avg_reward = total_reward / max(1, len(trace))
+    conf = _clip(0.5 * (1.0 - uncertainty) + 0.5 * avg_reward, 0.05, 0.98)
+    summary = {
+        "avg_reward": round(avg_reward, 4),
+        "updates": len(trace),
+        "confidence": round(conf, 4),
+        "delta_norm": round(delta_norm, 4),
+    }
+    return updated, summary
+
+
+def _plan_learning_update(inp: Dict[str, Any]) -> Dict[str, Any]:
+    learning = _collect_learning(inp)
+    trace = _collect_trace(inp)
+    uncertainty = _collect_uncertainty(inp)
+    new_weights, summary = _reinforce(learning["weights"], trace, uncertainty)
+
+    if not trace and learning["version"].get("id"):
+        # no change
+        out = {
+            "version": learning["version"],
+            "weights": learning["weights"],
+            "rollback": learning["rollback"],
+            "summary": summary,
+            "delta": {},
+        }
+        return out
+
+    now = _now_z()
+    version_payload = {
+        "parent_id": learning["version"].get("id"),
+        "weights": new_weights,
+        "summary": summary,
+        "ts": now,
+    }
+    ver_id = _sha1(version_payload)
+    delta = {
+        label: round(new_weights[label] - learning["weights"][label], 6)
+        for label in LEARNING_LABELS
+        if abs(new_weights[label] - learning["weights"][label]) >= 1e-6
+    }
+    out = {
+        "version": {"id": ver_id, "parent_id": learning["version"].get("id"), "updated_at": now},
+        "weights": {label: round(new_weights[label], 6) for label in LEARNING_LABELS},
+        "rollback": {
+            "version": learning["version"].get("id"),
+            "weights": {label: round(learning["weights"][label], 6) for label in LEARNING_LABELS},
+        },
+        "summary": summary,
+        "delta": delta,
+        "trace_used": len(trace),
+    }
+    return out
+
+
 # ------------------------- collectors -------------------------
 
 def _collect_metrics(inp: Dict[str, Any]) -> Dict[str, float]:
@@ -75,7 +248,14 @@ def _collect_slo(inp: Dict[str, Any]) -> Tuple[Optional[float], List[Dict[str, A
 def _collect_wm(inp: Dict[str, Any]) -> Dict[str, Any]:
     u = _as_float(_get(inp, ["world_model", "uncertainty", "score"], 0.0))
     rec = _get(inp, ["world_model", "uncertainty", "recommendation"], "")
-    return {"uncertainty": u, "recommendation": rec or ""}
+    trace = _get(inp, ["world_model", "trace", "error_history"], []) or []
+    rewards: List[float] = []
+    for item in trace[-12:]:
+        if isinstance(item, dict) and isinstance(item.get("reward"), (int, float)):
+            rewards.append(float(item["reward"]))
+    reward_avg = sum(rewards) / len(rewards) if rewards else 0.0
+    reward_trend = rewards[-3:] if rewards else []
+    return {"uncertainty": u, "recommendation": rec or "", "reward_avg": reward_avg, "reward_recent": reward_trend}
 
 
 # ------------------------- delta logic -------------------------
@@ -204,6 +384,51 @@ def _cap_changes(changes: List[Dict[str, Any]], max_per_turn: int = 8) -> List[D
     return changes[:max_per_turn]
 
 
+def _suggest_from_world_model(wm: Dict[str, Any]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    reward_avg = wm.get("reward_avg", 0.0)
+    recent = wm.get("reward_recent", []) or []
+    uncertainty = wm.get("uncertainty", 0.0)
+
+    if reward_avg < 0.35:
+        out.append(_mk_change("planner.learning.reward_bias", 0.15, "retune",
+                              "Prediction reward low; encourage clarification bias.",
+                              0.55))
+        out.append(_mk_change("world_model.model.prototype_mix", 0.65, "retune",
+                              "Blend prototypes more when reward is low.", 0.52, (0.3, 0.9)))
+    elif reward_avg > 0.75 and uncertainty < 0.4:
+        out.append(_mk_change("planner.learning.reward_bias", 0.05, "relax",
+                              "High reward and low uncertainty; allow more direct answers.",
+                              0.5, (0.0, 0.3)))
+
+    if recent:
+        trend = sum(1 if r >= 0.6 else -1 for r in recent)
+        if trend < 0:
+            out.append(_mk_change("dialog.surface.hedging", True, "set",
+                                  "Recent reward dropping; enable hedging language.", 0.48))
+
+    if uncertainty >= 0.7:
+        out.append(_mk_change("guardrails.must_confirm.u_threshold", 0.38, "tighten",
+                              "High uncertainty sustained; lower confirmation threshold.",
+                              0.6, (0.3, 0.6)))
+
+    return out
+
+
+def _blend_learning(changes: List[Dict[str, Any]], learning_summary: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if not changes:
+        return changes
+    conf_scale = _clip(float(learning_summary.get("confidence", 0.5)), 0.05, 1.0)
+    avg_reward = float(learning_summary.get("avg_reward", 0.0))
+    for ch in changes:
+        base_conf = float(ch.get("confidence", 0.5))
+        adjusted = base_conf * (conf_scale ** CONFIDENCE_DECAY)
+        if avg_reward < 0.3 and ch.get("change_type") == "relax":
+            adjusted *= 0.7
+        ch["confidence"] = round(_clip(adjusted, 0.05, 0.99), 3)
+    return changes
+
+
 # ------------------------- main -------------------------
 
 def b10f1_plan_policy_delta(input_json: Dict[str, Any]) -> Dict[str, Any]:
@@ -250,7 +475,11 @@ def b10f1_plan_policy_delta(input_json: Dict[str, Any]) -> Dict[str, Any]:
             "diag": {"reason": "no_signal", "counts": {"changes": 0}},
         }
 
+    learning_update = _plan_learning_update(input_json)
+
     changes = _suggest_from_checks(checks or [], mets, wm)
+    changes.extend(_suggest_from_world_model(wm))
+    changes = _blend_learning(changes, learning_update.get("summary", {}))
     changes = _cap_changes(changes, max_per_turn=8)
 
     delta = {
@@ -263,10 +492,26 @@ def b10f1_plan_policy_delta(input_json: Dict[str, Any]) -> Dict[str, Any]:
         "meta": {"source": "B10F1", "rules_version": RULES_VERSION, "created_at": _now_z()},
     }
 
+    adaptation_summary = {
+        "updates": learning_update.get("summary", {}).get("updates", 0),
+        "avg_reward": learning_update.get("summary", {}).get("avg_reward", 0.0),
+        "confidence": learning_update.get("summary", {}).get("confidence", 0.0),
+        "delta_norm": learning_update.get("summary", {}).get("delta_norm", 0.0),
+        "learning_version": learning_update.get("version", {}).get("id"),
+    }
+
     return {
         "status": "OK",
-        "policy": {"delta": delta},
-        "diag": {"reason": "ok", "counts": {"changes": len(changes)}},
+        "policy": {"delta": delta, "learning": learning_update},
+        "adaptation": {"policy": adaptation_summary},
+        "diag": {
+            "reason": "ok",
+            "counts": {
+                "changes": len(changes),
+                "learning_updates": adaptation_summary["updates"],
+                "learning_delta_keys": len(learning_update.get("delta", {})),
+            },
+        },
     }
 
 
