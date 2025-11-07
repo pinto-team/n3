@@ -1,11 +1,7 @@
-# File: noema/n3_api/routes/ui.py
-
-
 from fastapi import APIRouter
 from fastapi.responses import HTMLResponse
 
 router = APIRouter(tags=["UI"])
-
 
 INDEX_HTML = """
 <!doctype html>
@@ -29,6 +25,7 @@ canvas { width:100%; height:110px; border:1px solid #e5e5e5; margin-top:8px; bac
 input, button { font-size: 14px; padding: 4px 8px; }
 .small { font-size:12px; color:#666; }
 .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+textarea { font-family: system-ui, sans-serif; font-size:13px; }
 </style>
 </head>
 <body>
@@ -37,7 +34,7 @@ input, button { font-size: 14px; padding: 4px 8px; }
   <label>Thread ID:</label>
   <input id="tid" value="t-demo" />
   <button id="connect">Connect</button>
-  <span class="small" id="train-res"></span> <!-- NEW -->
+  <span class="small" id="train-res"></span>
 </div>
 <div id="layout">
   <div id="chat">
@@ -49,7 +46,24 @@ input, button { font-size: 14px; padding: 4px 8px; }
   </div>
   <div id="dash">
     <h3>Runtime dashboard</h3>
-    <!-- NEW: controls -->
+
+    <!-- 🟢 NEW: Ingest block -->
+    <div style="margin:8px 0; padding-bottom:8px; border-bottom:1px dashed #ddd;">
+      <div style="font-weight:600; margin-bottom:4px;">Ingest</div>
+      <div class="row" style="margin-bottom:4px;">
+        <input id="ing-id" placeholder="doc id" value="kb:intro" />
+      </div>
+      <div>
+        <textarea id="ing-text" style="width:100%; height:80px;"
+          placeholder="Paste text to index..."></textarea>
+      </div>
+      <div class="row" style="margin-top:6px;">
+        <button id="btn-ingest">Ingest</button>
+        <span class="small" id="ing-res"></span>
+      </div>
+    </div>
+
+    <!-- Existing controls -->
     <div style="margin:8px 0;">
       <div class="row" style="margin-bottom:6px;">
         <button id="btn-train">Train</button>
@@ -62,6 +76,7 @@ input, button { font-size: 14px; padding: 4px 8px; }
         <span class="small" id="rw-res"></span>
       </div>
     </div>
+
     <div class="stat">Uncertainty: <span id="stat-unc">-</span></div>
     <div class="stat">Policy confidence: <span id="stat-conf">-</span></div>
     <div class="stat">Avg reward: <span id="stat-reward">-</span></div>
@@ -71,6 +86,7 @@ input, button { font-size: 14px; padding: 4px 8px; }
     <canvas id="chart-updates" width="320" height="110"></canvas>
   </div>
 </div>
+
 <script>
 let wsPush = null, wsChat = null, tid = 't-demo', statsTimer = null, lastPush = '';
 const history = { unc: [], reward: [], updates: [] };
@@ -175,9 +191,33 @@ document.getElementById('send').onclick = () => {
   log('user', t);
   wsChat.send(t);
   document.getElementById('text').value = '';
+  document.getElementById('text').focus(); // 🟢 focus again
 };
 
-// NEW: Train / Apply from UI
+// 🟢 NEW: send on Enter
+document.getElementById('text').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    document.getElementById('send').click();
+  }
+});
+
+// 🟢 NEW: Ingest handler
+document.getElementById('btn-ingest').onclick = async () => {
+  const id = document.getElementById('ing-id').value || `kb:${Date.now()}`;
+  const text = document.getElementById('ing-text').value || '';
+  const r = await fetch('/skills/', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({
+      thread_id: tid,
+      calls: [{req_id:'r-ing', skill_id:'skill.dev.ingest', params:{id, text}}]
+    })
+  });
+  const j = await r.json();
+  document.getElementById('ing-res').textContent = r.ok ? 'ok' : ('err: ' + (j.detail || j));
+};
+
+// Existing Train / Apply / Reward
 document.getElementById('btn-train').onclick = async () => {
   const r = await fetch('/policy/train', {
     method: 'POST', headers: {'Content-Type':'application/json'},
@@ -205,7 +245,6 @@ document.getElementById('btn-apply').onclick = async () => {
   fetchStats();
 };
 
-// NEW: Reward from UI
 document.getElementById('btn-reward').onclick = async () => {
   const score = parseFloat(document.getElementById('rw').value);
   const payload = {
@@ -223,11 +262,6 @@ document.getElementById('btn-reward').onclick = async () => {
 </body>
 </html>
 """
-
-@router.get("/", response_class=HTMLResponse)
-def index():
-    return HTMLResponse(INDEX_HTML)
-
 
 @router.get("/", response_class=HTMLResponse)
 def index():
