@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 from datetime import datetime
@@ -15,6 +16,7 @@ __all__ = ["b3f3_retrieve"]
 RULES_VERSION = "1.0"
 DEFAULT_TOPK = 5
 GRAM_N = 3
+EMB_DIM = 64
 
 RE_WS = re.compile(r"\s+", re.UNICODE)
 
@@ -72,6 +74,26 @@ def _best_snippet(text: str, max_len: int = 120) -> str:
 
 
 # ------------------------- extractors -------------------------
+
+def _hash_embedding(text: str, dim: int = EMB_DIM) -> List[float]:
+    grams = _char_ngrams(text, GRAM_N)
+    if not grams:
+        return [0.0] * dim
+    buckets = [0.0] * dim
+    for g in grams:
+        h = int(hashlib.sha1(g.encode("utf-8")).hexdigest()[:8], 16) % dim
+        buckets[h] += 1.0
+    norm = math.sqrt(sum(v * v for v in buckets))
+    if norm > 0:
+        buckets = [v / norm for v in buckets]
+    return buckets
+
+
+def _cosine(a: List[float], b: List[float]) -> float:
+    if not a or not b:
+        return 0.0
+    return sum(x * y for x, y in zip(a, b))
+
 
 def _get_query_text(inp: Dict[str, Any]) -> Optional[str]:
     # Prefer perception.packz.text, fallback to world_model.context.current.text
@@ -270,6 +292,8 @@ def b3f3_retrieve(input_json: Dict[str, Any]) -> Dict[str, Any]:
 
     q_feats = _get_query_facets(input_json)
 
+    q_vec = _hash_embedding(q_text)
+
     scored: List[Dict[str, Any]] = []
     for cand in candidates:
         c_text, c_id, c_meta = _packz_like_to_text_id_meta(cand)
@@ -278,12 +302,19 @@ def b3f3_retrieve(input_json: Dict[str, Any]) -> Dict[str, Any]:
             continue
         facets = _facet_from_packz_like(cand)
         score, comp = _score_example(q_text, c_text, q_feats, facets)
+        c_vec = _hash_embedding(c_text)
+        cos = max(0.0, _cosine(q_vec, c_vec))
+        comp["semantic_cosine"] = round(cos, 6)
+        # Blend semantic score with lexical
+        score = 0.55 * score + 0.35 * cos + 0.1 * comp.get("recency_bonus", 0.0)
+        score = round(min(1.0, score), 6)
         scored.append({
             "id": c_id,
             "score": score,
             "components": comp,
             "snippet": _best_snippet(c_text),
             "facets": facets,
+            "vector": c_vec,
         })
 
     scored.sort(key=lambda x: x["score"], reverse=True)

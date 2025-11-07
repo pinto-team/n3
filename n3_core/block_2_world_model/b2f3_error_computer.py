@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 __all__ = ["b2f3_compute_error"]
 
 RULES_VERSION = "1.0"
+
+TRACE_LIMIT = 12
 
 LABELS = [
     "direct_answer",
@@ -96,6 +98,48 @@ def _target_from_speech_act(sa: str) -> Dict[str, float]:
     return t
 
 
+def _move_to_label(move: str) -> str:
+    mv = (move or "").lower()
+    if mv in {"answer", "final_answer", "nlg"}:
+        return "direct_answer"
+    if mv in {"execute", "action", "dispatch"}:
+        return "execute_action"
+    if mv in {"ask", "clarify", "confirm"}:
+        return "ask_clarification"
+    if mv in {"ack", "acknowledge"}:
+        return "acknowledge_only"
+    if mv in {"smalltalk", "small_talk"}:
+        return "small_talk"
+    if mv in {"closing", "goodbye"}:
+        return "closing"
+    if mv in {"refuse", "safecheck"}:
+        return "refuse_or_safecheck"
+    return "other"
+
+
+def _actual_outcome(inp: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    dialog = inp.get("dialog", {}) if isinstance(inp.get("dialog"), dict) else {}
+    final = dialog.get("final", {}) if isinstance(dialog.get("final"), dict) else {}
+    turn = dialog.get("turn", {}) if isinstance(dialog.get("turn"), dict) else {}
+
+    move = final.get("move") or turn.get("move")
+    label = _move_to_label(move if isinstance(move, str) else "")
+
+    exec_info = inp.get("executor", {}) if isinstance(inp.get("executor"), dict) else {}
+    best = exec_info.get("results", {}).get("best") if isinstance(exec_info.get("results"), dict) else None
+    exec_meta: Dict[str, Any] = {}
+    if isinstance(best, dict) and best:
+        exec_meta = {
+            "req_id": best.get("req_id"),
+            "ok": bool(best.get("ok", True)),
+            "kind": best.get("kind"),
+        }
+        if best.get("ok"):
+            label = "execute_action"
+
+    return label, exec_meta
+
+
 def _l1_distance(p: Dict[str, float], q: Dict[str, float]) -> float:
     return 0.5 * sum(abs(p[k] - q[k]) for k in LABELS)
 
@@ -112,6 +156,13 @@ def _kl_divergence(p: Dict[str, float], q: Dict[str, float], eps: float = 1e-12)
 def _top_key(d: Dict[str, float]) -> Tuple[str, float]:
     k = max(d.items(), key=lambda kv: kv[1])[0]
     return k, d[k]
+
+
+def _trace_history(inp: Dict[str, Any]) -> List[Dict[str, Any]]:
+    wm = inp.get("world_model", {}) if isinstance(inp.get("world_model"), dict) else {}
+    trace = wm.get("trace", {}) if isinstance(wm.get("trace"), dict) else {}
+    hist = trace.get("error_history") if isinstance(trace.get("error_history"), list) else []
+    return [h for h in hist if isinstance(h, dict)]
 
 
 def b2f3_compute_error(input_json: Dict[str, Any]) -> Dict[str, Any]:
@@ -178,11 +229,34 @@ def b2f3_compute_error(input_json: Dict[str, Any]) -> Dict[str, Any]:
     if t_sum <= 0:
         target = {k: 1.0 / len(LABELS) for k in LABELS}
 
-    l1 = round(_l1_distance(pred, target), 6)
-    kl = round(_kl_divergence(pred, target), 6)
+    actual_label, exec_meta = _actual_outcome(input_json)
+    actual = {k: 0.0 for k in LABELS}
+    if actual_label in actual:
+        actual[actual_label] = 1.0
+    else:
+        actual = {k: target.get(k, 0.0) for k in LABELS}
+        actual = {k: v / (sum(actual.values()) or 1.0) for k, v in actual.items()}
 
-    canon_label, canon_prob = _top_key(target)
-    pred_on_canon = pred.get(canon_label, 0.0)
+    l1 = round(_l1_distance(pred, actual), 6)
+    kl = round(_kl_divergence(pred, actual), 6)
+
+    canon_label, canon_prob = _top_key(actual)
+    pred_on_actual = pred.get(canon_label, 0.0)
+    top_pred_label, top_pred_prob = _top_key(pred)
+    reward = 1.0 if top_pred_label == canon_label else max(0.0, pred_on_actual - 0.2)
+
+    trace_entry = {
+        "actual": actual_label,
+        "target": canon_label,
+        "top_pred": top_pred_label,
+        "reward": round(reward, 4),
+        "l1": l1,
+        "kl": kl,
+        "speech_act": sa,
+        "exec": exec_meta,
+    }
+
+    history = (_trace_history(input_json) + [trace_entry])[-TRACE_LIMIT:]
 
     out = {
         "status": "OK",
@@ -190,15 +264,20 @@ def b2f3_compute_error(input_json: Dict[str, Any]) -> Dict[str, Any]:
             "error": {
                 "l1": l1,
                 "kl": kl,
-                "target": {k: round(v, 6) for k, v in target.items()},
+                "target": {k: round(v, 6) for k, v in actual.items()},
                 "predicted": {k: round(v, 6) for k, v in pred.items()},
-                "canonical_top": {"label": canon_label, "prob": round(canon_prob, 6)},
-                "predicted_on_canonical": round(pred_on_canon, 6),
+                "canonical_top": {"label": canon_label, "prob": round(actual[canon_label], 6)},
+                "predicted_on_canonical": round(pred_on_actual, 6),
                 "components": {
                     "speech_act": sa if isinstance(sa, str) else None,
                     "confidence": _safe_cf(feats.get("confidence"), 0.0),
+                    "actual_move": actual_label,
+                    "reward": round(reward, 4),
                 },
                 "meta": {"source": "B2F3", "rules_version": RULES_VERSION},
+            },
+            "trace": {
+                "error_history": history
             }
         },
         "diag": {"reason": "ok"},

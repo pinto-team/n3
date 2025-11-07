@@ -146,6 +146,24 @@ def _plan_inc_counters(counters: Dict[str, Any], ns: str, seq: Optional[int]) ->
     return ops
 
 
+def _plan_concept_version(op: Dict[str, Any], ns: str, seq: Optional[int]) -> List[Dict[str, Any]]:
+    ops: List[Dict[str, Any]] = []
+    version = op.get("doc") if isinstance(op.get("doc"), dict) else {}
+    ver_id = version.get("id") if isinstance(version.get("id"), str) else None
+    if not ver_id:
+        return ops
+    updates = op.get("updates") if isinstance(op.get("updates"), dict) else {}
+    ops.append({"op": "put", "key": _kv_key(ns, "concept", "versions", ver_id), "value": version, "seq": seq})
+    if isinstance(seq, int):
+        seq += 1
+    ops.append({"op": "put", "key": _kv_key(ns, "concept", "updates", ver_id), "value": updates, "seq": seq})
+    if isinstance(seq, int):
+        seq += 1
+    ops.append({"op": "put", "key": _kv_key(ns, "concept", "current"),
+                "value": {"version_id": ver_id, "updated_at": version.get("updated_at")}, "seq": seq})
+    return ops
+
+
 # ------------------------- main -------------------------
 
 def b8f2_plan_apply(input_json: Dict[str, Any]) -> Dict[str, Any]:
@@ -230,6 +248,13 @@ def b8f2_plan_apply(input_json: Dict[str, Any]) -> Dict[str, Any]:
             incs += len(c_ops)
             if isinstance(seq, int):
                 seq += len(c_ops)
+
+        elif kind == "record_concept_version":
+            cv_ops = _plan_concept_version(op, ns, seq)
+            apply_ops.extend(cv_ops)
+            puts += sum(1 for x in cv_ops if x.get("op") == "put")
+            if isinstance(seq, int):
+                seq += len(cv_ops)
 
         else:
             # Unknown WAL op: ignore safely

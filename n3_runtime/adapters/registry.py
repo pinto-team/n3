@@ -34,6 +34,12 @@ def build_registry() -> Dict[str, StepFn]:
     _bind(reg, "b9f2_build_trace",         "n3_core.block_9_observability.b9f2_trace_builder",        "b9f2_build_trace")
     _bind(reg, "b9f3_evaluate_slo",        "n3_core.block_9_observability.b9f3_slo_evaluator",        "b9f3_evaluate_slo")
 
+    # --- B4 Concept Graph ---
+    _bind(reg, "b4f1_mine_patterns", "n3_core.block_4_concept_graph.b4f1_pattern_miner", "b4f1_mine_patterns")
+    _bind(reg, "b4f2_manage_nodes",   "n3_core.block_4_concept_graph.b4f2_node_manager",   "b4f2_manage_nodes")
+    _bind(reg, "b4f3_score_edges",    "n3_core.block_4_concept_graph.b4f3_edge_scorer",    "b4f3_score_edges")
+    _bind(reg, "b4f4_extract_rules",  "n3_core.block_4_concept_graph.b4f4_rule_extractor", "b4f4_extract_rules")
+
     # --- B10 Adaptation ---
     _bind(reg, "b10f1_plan_policy_delta",  "n3_core.block_10_adaptation.b10f1_policy_delta_planner",  "b10f1_plan_policy_delta")
     _bind(reg, "b10f2_plan_policy_apply",  "n3_core.block_10_adaptation.b10f2_policy_apply_planner",  "b10f2_plan_policy_apply")

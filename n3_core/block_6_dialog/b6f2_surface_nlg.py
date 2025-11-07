@@ -108,8 +108,26 @@ def _render_move(move: str, content: str, filled: Dict[str, Any], lang: str) -> 
     if move == "execute":
         # Usually not surfaced to user; provide a brief status line if needed
         return content or ("در حال اجرا..." if lang == "fa" else "Running the action...")
+    if move == "reflection":
+        return content or ("در حال بررسی یک ارتباط جدید هستم." if lang == "fa" else "I’m reviewing a new connection I found.")
     # Unknown
     return content or ("باشه." if lang == "fa" else "Okay.")
+
+
+def _policy_confidence(inp: Dict[str, Any]) -> float:
+    return float(_get(inp, ["adaptation", "policy", "confidence"], 0.6))
+
+
+def _hedge(text: str, lang: str, confidence: float) -> str:
+    if confidence >= 0.45 or not text:
+        return text
+    if lang == "fa":
+        prefix = "فکر می‌کنم "
+    else:
+        prefix = "I might be mistaken, but "
+    if text.lower().startswith(prefix.lower()):
+        return text
+    return prefix + text[0].lower() + text[1:]
 
 
 # ------------------------- main -------------------------
@@ -150,10 +168,12 @@ def b6f2_surface_nlg(input_json: Dict[str, Any]) -> Dict[str, Any]:
     # Language hint
     dir_hint = _get(input_json, ["world_model", "context", "features", "dir"], None)
     lang = _detect_lang(content, dir_hint)
+    confidence = _policy_confidence(input_json)
 
     styled = _style_config(lang)
     text = _render_move(move, content, filled, lang)
     text = _clean_spaces(text)
+    text = _hedge(text, lang, confidence)
     text = _trim(text)
 
     return {
@@ -163,7 +183,7 @@ def b6f2_surface_nlg(input_json: Dict[str, Any]) -> Dict[str, Any]:
                 "text": text,
                 "language": lang,
                 "move": move,
-                "meta": {"source": "B6F2", "rules_version": RULES_VERSION, "style": styled}
+                "meta": {"source": "B6F2", "rules_version": RULES_VERSION, "style": {**styled, "confidence": round(confidence, 3)}}
             }
         },
         "diag": {"reason": "ok"},

@@ -22,11 +22,15 @@ LABELS = [
 ]
 
 
-def _get_ctx_pred_error(inp: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, float], Dict[str, Any]]:
+def _get_ctx_pred_error(inp: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, float], Dict[str, Any], float]:
     wm = inp.get("world_model", {}) if isinstance(inp.get("world_model"), dict) else {}
     ctx = wm.get("context", {}) if isinstance(wm.get("context"), dict) else {}
     pred = wm.get("prediction", {}) if isinstance(wm.get("prediction"), dict) else {}
     err = wm.get("error", {}) if isinstance(wm.get("error"), dict) else {}
+    reward = 0.0
+    comps = err.get("components", {}) if isinstance(err.get("components"), dict) else {}
+    if isinstance(comps.get("reward"), (int, float)):
+        reward = float(comps.get("reward"))
 
     exp = pred.get("expected_reply")
     if not isinstance(exp, dict):
@@ -40,7 +44,7 @@ def _get_ctx_pred_error(inp: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, 
     else:
         dist = {}
 
-    return ctx, dist, err
+    return ctx, dist, err, reward
 
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
@@ -94,6 +98,12 @@ def _recommendation(score: float, conf: float, act_prob: float) -> str:
     return "balanced"
 
 
+def _reward_uncertainty(reward: float) -> float:
+    if reward <= 0:
+        return 1.0
+    return max(0.0, 1.0 - min(1.0, reward))
+
+
 def b2f4_uncertainty(input_json: Dict[str, Any]) -> Dict[str, Any]:
     """
     B2F4 — WorldModel.Uncertainty (Noema)
@@ -117,7 +127,7 @@ def b2f4_uncertainty(input_json: Dict[str, Any]) -> Dict[str, Any]:
         "diag": { "reason": "ok|no_prediction" }
       }
     """
-    ctx, dist, err = _get_ctx_pred_error(input_json)
+    ctx, dist, err, reward = _get_ctx_pred_error(input_json)
     if not dist:
         return {
             "status": "SKIP",
@@ -134,15 +144,17 @@ def b2f4_uncertainty(input_json: Dict[str, Any]) -> Dict[str, Any]:
     u_topgap = _top_gap_uncertainty(dist)  # 0..1
     u_l1 = _safe_float(err.get("l1"), 0.0)  # 0..1
     u_kl = _kl_to_01(_safe_float(err.get("kl"), 0.0))
+    u_reward = _reward_uncertainty(reward)
     u_conf = 1.0 - _safe_float(feats.get("confidence"), 0.0)
     u_nov = _safe_float(feats.get("novelty"), 0.5) * 0.5  # mild
 
     # Weights (sum ~ 1.0; error treated jointly)
-    W_ENT = 0.35
-    W_GAP = 0.20
-    W_ERR = 0.25  # will combine L1 & KL
-    W_CONF = 0.15
-    W_NOV = 0.05
+    W_ENT = 0.3
+    W_GAP = 0.18
+    W_ERR = 0.22  # combine L1 & KL
+    W_CONF = 0.12
+    W_NOV = 0.06
+    W_REWARD = 0.12
 
     u_err = 0.5 * u_l1 + 0.5 * u_kl
 
@@ -151,7 +163,8 @@ def b2f4_uncertainty(input_json: Dict[str, Any]) -> Dict[str, Any]:
             W_GAP * u_topgap +
             W_ERR * u_err +
             W_CONF * u_conf +
-            W_NOV * u_nov
+            W_NOV * u_nov +
+            W_REWARD * u_reward
     )
     score = max(0.0, min(1.0, round(score, 3)))
 
@@ -159,6 +172,7 @@ def b2f4_uncertainty(input_json: Dict[str, Any]) -> Dict[str, Any]:
     if u_entropy >= 0.75: flags.append("high_entropy")
     if u_topgap >= 0.75: flags.append("ambiguous_top2")
     if u_err >= 0.5:  flags.append("high_model_error")
+    if u_reward >= 0.5: flags.append("low_reward")
     if u_conf >= 0.5:  flags.append("low_confidence")
     if u_nov >= 0.35: flags.append("high_novelty")
 
@@ -173,6 +187,7 @@ def b2f4_uncertainty(input_json: Dict[str, Any]) -> Dict[str, Any]:
         {"name": "model_error", "value": round(u_err, 3), "weight": W_ERR, "contrib": round(W_ERR * u_err, 3)},
         {"name": "inv_confidence", "value": round(u_conf, 3), "weight": W_CONF, "contrib": round(W_CONF * u_conf, 3)},
         {"name": "novelty_mild", "value": round(u_nov, 3), "weight": W_NOV, "contrib": round(W_NOV * u_nov, 3)},
+        {"name": "reward_gap", "value": round(u_reward, 3), "weight": W_REWARD, "contrib": round(W_REWARD * u_reward, 3)},
     ]
 
     return {

@@ -112,19 +112,21 @@ def _node_score(nodes_by_id: Dict[str, Dict[str, Any]], nid: str) -> float:
     return _safe_float(n.get("score"), 0.0)
 
 
-def _edge_weight(pmi: float, cooc: int, ns: float) -> Tuple[float, Dict[str, float]]:
+def _edge_weight(pmi: float, cooc: int, ns: float, reward_avg: float) -> Tuple[float, Dict[str, float]]:
     # Squash PMI to 0..1, cooc to ~0..1, and normalize node strength
-    pmi_n = _squash_pos(pmi)  # fast monotone
-    cooc_n = _squash_pos(cooc / 5.0)  # ≈5 cooc → ~0.63
-    ns_n = _squash_pos(ns / 3.0)  # node score ~3 → ~0.63
+    pmi_n = _squash_pos(pmi)
+    cooc_n = _squash_pos(cooc / 5.0)
+    ns_n = _squash_pos(ns / 3.0)
+    reward_n = _squash_pos(reward_avg)
 
-    # Blend (sum ~ 1.0)
-    W_PMI, W_COO, W_NS = 0.5, 0.3, 0.2
-    w = W_PMI * pmi_n + W_COO * cooc_n + W_NS * ns_n
+    # Blend weights favouring consistent reward alignment
+    W_PMI, W_COO, W_NS, W_REWARD = 0.4, 0.25, 0.15, 0.2
+    w = W_PMI * pmi_n + W_COO * cooc_n + W_NS * ns_n + W_REWARD * reward_n
     return (round(min(1.0, max(0.0, w)), 6), {
         "pmi_n": round(pmi_n, 6),
         "cooc_n": round(cooc_n, 6),
         "node_strength_n": round(ns_n, 6),
+        "reward_n": round(reward_n, 6),
     })
 
 
@@ -194,15 +196,20 @@ def b4f3_score_edges(input_json: Dict[str, Any]) -> Dict[str, Any]:
         u, v = _edge_key(na, nb)
         pmi = _safe_float(e.get("pmi"), 0.0)
         cooc = _safe_int(e.get("cooc"), 0)
+        reward_avg = _safe_float(e.get("reward_avg"), 0.0)
 
         # Merge
         bucket = agg.get((u, v))
         if not bucket:
-            bucket = {"u": u, "v": v, "pmi": 0.0, "cooc": 0, "labels": set()}
+            bucket = {"u": u, "v": v, "pmi": 0.0, "cooc": 0, "labels": set(),
+                      "reward_sum": 0.0, "reward_weight": 0.0}
             agg[(u, v)] = bucket
 
         bucket["pmi"] = max(bucket["pmi"], pmi)  # keep strongest PMI seen
         bucket["cooc"] += max(0, cooc)  # sum support
+        weight = max(1.0, float(cooc))
+        bucket["reward_sum"] += reward_avg * weight
+        bucket["reward_weight"] += weight
         if len(bucket["labels"]) < MAX_LABELS_PER_EDGE:
             bucket["labels"].add(f"{a} ~ {b}")
         linked_pairs += 1
@@ -219,13 +226,15 @@ def b4f3_score_edges(input_json: Dict[str, Any]) -> Dict[str, Any]:
     out_edges: List[Dict[str, Any]] = []
     for (u, v), data in agg.items():
         ns = min(_node_score(nodes_by_id, u), _node_score(nodes_by_id, v))
-        w, comps = _edge_weight(data["pmi"], data["cooc"], ns)
+        reward_avg = data["reward_sum"] / max(1.0, data.get("reward_weight", 0.0))
+        w, comps = _edge_weight(data["pmi"], data["cooc"], ns, reward_avg)
         out_edges.append({
             "u": u, "v": v,
             "w": w,
             "pmi": round(float(data["pmi"]), 6),
             "cooc": int(data["cooc"]),
             "support": int(data["cooc"]),
+            "reward_avg": round(float(reward_avg), 6),
             "labels": list(data["labels"])[:MAX_LABELS_PER_EDGE],
             "undirected": True,
             "components": comps,

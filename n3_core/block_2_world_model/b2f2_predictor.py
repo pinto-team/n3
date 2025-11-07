@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+import hashlib
+import math
+from collections import Counter
+from typing import Any, Dict, Iterable, List, Tuple
 
 __all__ = ["b2f2_predict"]
 
@@ -30,6 +33,10 @@ BASE_PRIORS = {
     "refuse_or_safecheck": 0.05,
     "other": 0.10,
 }
+
+EMB_N = 3
+EMB_DIM = 64
+TRACE_LIMIT = 12
 
 
 def _get_context(inp: Dict[str, Any]) -> Dict[str, Any]:
@@ -134,6 +141,100 @@ def _gate_hint(probs: Dict[str, float]) -> str:
     return "balanced"
 
 
+def _iter_char_ngrams(text: str, n: int = EMB_N) -> Iterable[str]:
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= n:
+        return [text]
+    return (text[i:i + n] for i in range(len(text) - n + 1))
+
+
+def _text_embedding(text: str, dim: int = EMB_DIM) -> Tuple[List[float], List[Tuple[str, int]]]:
+    counts = Counter(_iter_char_ngrams(text))
+    if not counts:
+        return [0.0] * dim, []
+    vec = [0.0] * dim
+    for gram, cnt in counts.items():
+        h = int(hashlib.sha1(gram.encode("utf-8")).hexdigest()[:8], 16) % dim
+        vec[h] += float(cnt)
+    # L2 normalize
+    norm = math.sqrt(sum(v * v for v in vec))
+    if norm > 0:
+        vec = [v / norm for v in vec]
+    top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+    return vec, top
+
+
+def _cosine(a: List[float], b: List[float]) -> float:
+    if not a or not b:
+        return 0.0
+    return sum(x * y for x, y in zip(a, b))
+
+
+def _blend(a: float, b: float, alpha: float) -> float:
+    return (1.0 - alpha) * a + alpha * b
+
+
+def _transitions_for_sa(inp: Dict[str, Any], sa: str) -> Dict[str, float]:
+    wm = inp.get("world_model", {})
+    model = wm.get("model", {}) if isinstance(wm.get("model"), dict) else {}
+    trans = model.get("transitions", {}) if isinstance(model.get("transitions"), dict) else {}
+    row = trans.get((sa or "").lower(), {})
+    if isinstance(row, dict):
+        return {k: float(v) for k, v in row.items() if k in LABELS}
+    return {}
+
+
+def _prototype_vectors(inp: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    wm = inp.get("world_model", {})
+    model = wm.get("model", {}) if isinstance(wm.get("model"), dict) else {}
+    prot = model.get("prototypes", {}) if isinstance(model.get("prototypes"), dict) else {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for label, info in prot.items():
+        if label not in LABELS or not isinstance(info, dict):
+            continue
+        vec = info.get("vector")
+        if isinstance(vec, list) and vec:
+            out[label] = {
+                "vector": [float(x) for x in vec],
+                "count": int(info.get("count", 1))
+            }
+    return out
+
+
+def _scores_from_transitions(sa: str, probs: Dict[str, float], inp: Dict[str, Any], notes: List[str]) -> None:
+    row = _transitions_for_sa(inp, sa)
+    total = sum(row.values())
+    if total <= 0:
+        return
+    for label, cnt in row.items():
+        weight = cnt / total
+        _add(probs, label, 0.6 * weight, notes, f"transition:{sa}->{label}:{weight:.2f}")
+
+
+def _scores_from_prototypes(vec: List[float], probs: Dict[str, float], inp: Dict[str, Any], notes: List[str]) -> Dict[str, float]:
+    prot = _prototype_vectors(inp)
+    sims: Dict[str, float] = {}
+    if not prot:
+        return sims
+    for label, info in prot.items():
+        sim = max(0.0, _cosine(vec, info.get("vector", [])))
+        if sim <= 0:
+            continue
+        sims[label] = sim
+        weight = min(0.5, sim * math.log1p(max(1, info.get("count", 1))))
+        _add(probs, label, weight, notes, f"prototype:{label}:{sim:.2f}")
+    return sims
+
+
+def _collect_history(inp: Dict[str, Any]) -> List[Dict[str, Any]]:
+    wm = inp.get("world_model", {})
+    hist = wm.get("trace", {}) if isinstance(wm.get("trace"), dict) else {}
+    records = hist.get("prediction_history") if isinstance(hist.get("prediction_history"), list) else []
+    return [r for r in records if isinstance(r, dict)]
+
+
 def b2f2_predict(input_json: Dict[str, Any]) -> Dict[str, Any]:
     """
     B2F2 — WorldModel.Predictor (Noema)
@@ -206,6 +307,19 @@ def b2f2_predict(input_json: Dict[str, Any]) -> Dict[str, Any]:
     _addressing_adjust(to_noema, probs, notes)
     _novelty_adjust(nov, probs, notes)
 
+    text = cur.get("text") if isinstance(cur.get("text"), str) else ""
+    vec, top_grams = _text_embedding(text)
+
+    sim_notes = _scores_from_prototypes(vec, probs, input_json, notes)
+    _scores_from_transitions(sa or "", probs, input_json, notes)
+
+    history = _collect_history(input_json)
+    if history:
+        last = history[-1]
+        last_label = last.get("top") if isinstance(last.get("top"), str) else ""
+        if last_label in LABELS:
+            _add(probs, last_label, 0.05, notes, f"history_bias:{last_label}")
+
     probs = _clip_nonneg(probs)
     probs = _normalize(probs)
 
@@ -214,13 +328,28 @@ def b2f2_predict(input_json: Dict[str, Any]) -> Dict[str, Any]:
     should_collect = probs.get("ask_clarification", 0.0) >= 0.35
     safecheck = ((sa or "").lower() == "command" and conf < 0.7) or (probs.get("execute_action", 0.0) > 0.5)
 
-    top = max(probs.items(), key=lambda kv: kv[1])[0]
+    top_label, top_prob = max(probs.items(), key=lambda kv: kv[1])
+
+    trace_entry = {
+        "turn_id": cur.get("id"),
+        "text_hash": hashlib.sha1(text.encode("utf-8")).hexdigest() if text else "",
+        "top": top_label,
+        "top_prob": round(top_prob, 4),
+        "speech_act": sa,
+        "confidence": conf,
+        "novelty": nov,
+        "sim_notes": {k: round(v, 4) for k, v in sim_notes.items()},
+        "grams": top_grams,
+        "notes": notes[:TRACE_LIMIT],
+    }
+
+    history_out = (history + [trace_entry])[-TRACE_LIMIT:]
 
     out = {
         "status": "OK",
         "world_model": {
             "prediction": {
-                "top": top,
+                "top": top_label,
                 "expected_reply": {k: round(v, 4) for k, v in probs.items()},
                 "hints": {
                     "turn_gate": gate,
@@ -229,6 +358,9 @@ def b2f2_predict(input_json: Dict[str, Any]) -> Dict[str, Any]:
                 },
                 "rationale": notes[:12],  # keep it short
                 "meta": {"source": "B2F2", "rules_version": RULES_VERSION},
+            },
+            "trace": {
+                "prediction_history": history_out
             }
         },
         "diag": {"reason": "ok"},
