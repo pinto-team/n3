@@ -2,7 +2,8 @@
 # File: noema/n3_api/routes/ws.py
 # ============================
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, FastAPI
+from contextlib import asynccontextmanager
 from n3_api.utils.state import ensure_state, update_state, get_sessions
 from n3_runtime.loop.io_tick import run_tick_io
 from n3_drivers.transport import http_dev
@@ -11,6 +12,7 @@ import asyncio
 
 router = APIRouter(tags=["WebSocket"])
 _DRIVERS = build_drivers()
+
 
 @router.websocket("/ws/{thread_id}")
 async def ws_thread(websocket: WebSocket, thread_id: str):
@@ -23,6 +25,7 @@ async def ws_thread(websocket: WebSocket, thread_id: str):
             await websocket.send_json(msg)
     except WebSocketDisconnect:
         http_dev.unsubscribe(q)
+
 
 @router.websocket("/ws/chat/{thread_id}")
 async def ws_chat(websocket: WebSocket, thread_id: str):
@@ -50,9 +53,13 @@ async def ws_chat(websocket: WebSocket, thread_id: str):
     except WebSocketDisconnect:
         return
 
-@router.on_event("startup")
-async def _start_daemon():
-    """Background daemon for ticking all sessions."""
+
+# =========================================================
+# Lifespan handler (replaces deprecated @router.on_event)
+# =========================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context replacing on_event('startup')."""
     async def daemon():
         while True:
             try:
@@ -62,4 +69,9 @@ async def _start_daemon():
             except Exception:
                 pass
             await asyncio.sleep(0.25)
-    asyncio.create_task(daemon())
+
+    task = asyncio.create_task(daemon())
+    try:
+        yield  # app runs while this context is active
+    finally:
+        task.cancel()

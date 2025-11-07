@@ -6,11 +6,12 @@ from fastapi.responses import HTMLResponse
 
 router = APIRouter(tags=["UI"])
 
+
 INDEX_HTML = """
 <!doctype html>
 <html>
 <head>
-<meta charset=\"utf-8\" />
+<meta charset="utf-8" />
 <title>Noema — local console</title>
 <style>
 body { font-family: system-ui, sans-serif; margin: 24px; background:#fafafa; }
@@ -21,37 +22,53 @@ body { font-family: system-ui, sans-serif; margin: 24px; background:#fafafa; }
 .msg.user { color:#333; }
 .msg.assistant { color:#0a6; }
 .msg.system { color:#777; font-style: italic; }
-#dash { width:320px; border:1px solid #ddd; background:#fff; padding:12px; box-shadow:0 1px 2px rgba(0,0,0,0.08); }
+#dash { width:340px; border:1px solid #ddd; background:#fff; padding:12px; box-shadow:0 1px 2px rgba(0,0,0,0.08); }
 #dash h3 { margin-top:0; }
 .stat { margin:6px 0; font-size:13px; }
 canvas { width:100%; height:110px; border:1px solid #e5e5e5; margin-top:8px; background:#fcfcfc; }
 input, button { font-size: 14px; padding: 4px 8px; }
+.small { font-size:12px; color:#666; }
+.row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
 </style>
 </head>
 <body>
 <h2>Noema — local console</h2>
-<div>
+<div class="row">
   <label>Thread ID:</label>
-  <input id=\"tid\" value=\"t-demo\" />
-  <button id=\"connect\">Connect</button>
+  <input id="tid" value="t-demo" />
+  <button id="connect">Connect</button>
+  <span class="small" id="train-res"></span> <!-- NEW -->
 </div>
-<div id=\"layout\">
-  <div id=\"chat\">
-    <div id=\"log\"></div>
-    <div style=\"margin-top:12px;\">
-      <input id=\"text\" style=\"width:70%;\" placeholder=\"Type message...\" />
-      <button id=\"send\">Send</button>
+<div id="layout">
+  <div id="chat">
+    <div id="log"></div>
+    <div style="margin-top:12px;">
+      <input id="text" style="width:70%;" placeholder="Type message..." />
+      <button id="send">Send</button>
     </div>
   </div>
-  <div id=\"dash\">
+  <div id="dash">
     <h3>Runtime dashboard</h3>
-    <div class=\"stat\">Uncertainty: <span id=\"stat-unc\">-</span></div>
-    <div class=\"stat\">Policy confidence: <span id=\"stat-conf\">-</span></div>
-    <div class=\"stat\">Avg reward: <span id=\"stat-reward\">-</span></div>
-    <div class=\"stat\">Concept version: <span id=\"stat-concept\">-</span></div>
-    <canvas id=\"chart-unc\" width=\"320\" height=\"110\"></canvas>
-    <canvas id=\"chart-reward\" width=\"320\" height=\"110\"></canvas>
-    <canvas id=\"chart-updates\" width=\"320\" height=\"110\"></canvas>
+    <!-- NEW: controls -->
+    <div style="margin:8px 0;">
+      <div class="row" style="margin-bottom:6px;">
+        <button id="btn-train">Train</button>
+        <button id="btn-apply">Apply Policy</button>
+      </div>
+      <div class="row">
+        <label class="small">Reward:</label>
+        <input type="range" id="rw" min="0" max="1" step="0.1" value="0.8" />
+        <button id="btn-reward">Give</button>
+        <span class="small" id="rw-res"></span>
+      </div>
+    </div>
+    <div class="stat">Uncertainty: <span id="stat-unc">-</span></div>
+    <div class="stat">Policy confidence: <span id="stat-conf">-</span></div>
+    <div class="stat">Avg reward: <span id="stat-reward">-</span></div>
+    <div class="stat">Concept version: <span id="stat-concept">-</span></div>
+    <canvas id="chart-unc" width="320" height="110"></canvas>
+    <canvas id="chart-reward" width="320" height="110"></canvas>
+    <canvas id="chart-updates" width="320" height="110"></canvas>
   </div>
 </div>
 <script>
@@ -100,9 +117,11 @@ const fetchStats = () => {
     const concept = data.concept || {};
     const telemetry = data.telemetry || {};
     const summary = (telemetry.summary) || {};
-    document.getElementById('stat-unc').textContent = (summary.uncertainty ?? '-').toFixed ? summary.uncertainty.toFixed(3) : summary.uncertainty;
-    document.getElementById('stat-conf').textContent = (adaptation.confidence ?? '-').toFixed ? adaptation.confidence.toFixed(3) : adaptation.confidence;
-    document.getElementById('stat-reward').textContent = (adaptation.avg_reward ?? '-').toFixed ? adaptation.avg_reward.toFixed(3) : adaptation.avg_reward;
+    const to3 = v => (typeof v === 'number' && v.toFixed) ? v.toFixed(3) : v;
+
+    document.getElementById('stat-unc').textContent = to3(summary.uncertainty ?? '-');
+    document.getElementById('stat-conf').textContent = to3(adaptation.confidence ?? '-');
+    document.getElementById('stat-reward').textContent = to3(adaptation.avg_reward ?? '-');
     document.getElementById('stat-concept').textContent = (concept.version || {}).id || '-';
 
     const unc = typeof summary.uncertainty === 'number' ? summary.uncertainty : 0;
@@ -157,10 +176,58 @@ document.getElementById('send').onclick = () => {
   wsChat.send(t);
   document.getElementById('text').value = '';
 };
+
+// NEW: Train / Apply from UI
+document.getElementById('btn-train').onclick = async () => {
+  const r = await fetch('/policy/train', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({thread_id: tid})
+  });
+  const j = await r.json();
+  document.getElementById('train-res').textContent = 'trained: ' + (j.policy_updates?.version || '');
+  fetchStats();
+};
+
+document.getElementById('btn-apply').onclick = async () => {
+  const payload = {
+    thread_id: tid,
+    changes: [
+      {"path":"policy.learning.enabled","op":"set","value":true},
+      {"path":"features.cheap_models","op":"set","value":false}
+    ]
+  };
+  const r = await fetch('/policy/apply', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(payload)
+  });
+  const j = await r.json();
+  document.getElementById('train-res').textContent = 'applied: ' + (j.activated_version?.id || '');
+  fetchStats();
+};
+
+// NEW: Reward from UI
+document.getElementById('btn-reward').onclick = async () => {
+  const score = parseFloat(document.getElementById('rw').value);
+  const payload = {
+    thread_id: tid,
+    calls: [{req_id:'r-rew', skill_id:'skill.dev.reward', params:{score, reason:'manual'}}]
+  };
+  const r = await fetch('/skills/', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(payload)
+  });
+  if (r.ok) document.getElementById('rw-res').textContent = 'ok';
+  fetchStats();
+};
 </script>
 </body>
 </html>
 """
+
+@router.get("/", response_class=HTMLResponse)
+def index():
+    return HTMLResponse(INDEX_HTML)
+
 
 @router.get("/", response_class=HTMLResponse)
 def index():

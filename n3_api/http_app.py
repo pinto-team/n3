@@ -1,12 +1,18 @@
+# ============================
 # File: noema/n3_api/http_app.py
+# ============================
+import os
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.responses import FileResponse
+
 from n3_api.routes import policy, knowledge, skills, chat, initiative, ws, ui
 from n3_api.utils.state import ensure_state, get_sessions
 
 app = FastAPI(title="Noema Dev API", version="0.2.0")
 
+# Allow all CORS origins (for development)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,6 +29,10 @@ app.include_router(chat.router)
 app.include_router(initiative.router)
 app.include_router(ws.router)
 app.include_router(ui.router)
+
+# 🔄 Attach lifespan handler from ws.py
+app.router.lifespan_context = ws.lifespan
+
 
 @app.get("/health")
 def health():
@@ -58,6 +68,13 @@ def introspect(thread_id: str):
         },
         "telemetry": telemetry,
     }
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    path = os.path.join(os.path.dirname(__file__), "static", "favicon.ico")
+    if os.path.exists(path):
+        return FileResponse(path)
+    return {"detail": "favicon not found"}
 
 if __name__ == "__main__":
     import uvicorn

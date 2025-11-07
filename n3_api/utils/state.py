@@ -1,89 +1,87 @@
-# ================================
-# File: noema/n3_api/utils/state.py
-# ================================
+# noema/n3_api/utils/state.py
 
-from typing import Dict, Any
+import os, sqlite3, json, threading
 from datetime import datetime, timezone
-from n3_api.utils.dev_config import dev_config
 
-LABELS = [
-    "direct_answer",
-    "execute_action",
-    "ask_clarification",
-    "acknowledge_only",
-    "small_talk",
-    "closing",
-    "refuse_or_safecheck",
-    "other",
-]
-
-
-def _default_learning_state() -> Dict[str, Any]:
-    base_weight = 0.5
-    now = now_iso()
-    weights = {label: base_weight for label in LABELS}
-    return {
-        "version": {
-            "id": "policy-learning-v0",
-            "parent_id": None,
-            "updated_at": now,
-        },
-        "weights": weights,
-        "rollback": {
-            "version": None,
-            "weights": weights,
-        },
-        "summary": {
-            "avg_reward": 0.0,
-            "updates": 0,
-            "confidence": 0.5,
-        },
-    }
-
-_SESSIONS: Dict[str, Dict[str, Any]] = {}
+DB_PATH = os.getenv("NOEMA_DB", "noema_state.db")
+_CONN_LOCK = threading.Lock()
+_STATE_CACHE: dict[str, dict] = {}
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+# ★ NEW: now_ms برای initiative.py
 def now_ms() -> int:
-    import time
-    return int(time.time() * 1000)
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
 
-def ensure_state(thread_id: str) -> Dict[str, Any]:
-    """Initialize or fetch an in-memory session state."""
-    if thread_id not in _SESSIONS:
-        learning = _default_learning_state()
-        _SESSIONS[thread_id] = {
-            "session": {"thread_id": thread_id},
-            "policy": {
-                "apply_stage": {
-                    "version": {"id": "ver-dev", "parent_id": None, "created_at": now_iso()},
-                    "doc": {"config": dev_config()},
-                    "rollback_point": {"id": "ver-dev", "parent_id": None, "keys": []}
-                },
-                "learning": learning,
-            },
-            "observability": {
-                "slo": {"score": 0.95},
-                "telemetry": {
-                    "summary": {
-                        "policy_updates": 0,
-                        "concept_new_rules": 0,
-                        "avg_reward": 0.0,
-                        "uncertainty": 0.2,
-                    }
-                },
-            },
-            "world_model": {"uncertainty": {"score": 0.2}},
-            "concept_graph": {
-                "version": {"id": "concept-v0", "parent_id": None, "updated_at": now_iso()},
-            },
-            "adaptation": {"policy": learning["summary"]},
-        }
-    return _SESSIONS[thread_id]
+def _conn():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS session_state(
+        thread_id   TEXT PRIMARY KEY,
+        state_json  TEXT NOT NULL,
+        updated_at  TEXT NOT NULL
+    )
+    """)
+    return conn
 
-def update_state(thread_id: str, new_state: Dict[str, Any]):
-    _SESSIONS[thread_id] = new_state
+def _load(thread_id: str) -> dict | None:
+    with _CONN_LOCK:
+        with _conn() as c:
+            row = c.execute(
+                "SELECT state_json FROM session_state WHERE thread_id=?",
+                (thread_id,)
+            ).fetchone()
+    return json.loads(row[0]) if row else None
 
-def get_sessions():
-    return _SESSIONS
+def _save(thread_id: str, state: dict) -> None:
+    blob = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+    ts = now_iso()
+    with _CONN_LOCK:
+        with _conn() as c:
+            c.execute("""
+            INSERT INTO session_state(thread_id, state_json, updated_at)
+            VALUES (?,?,?)
+            ON CONFLICT(thread_id) DO UPDATE SET
+              state_json = excluded.state_json,
+              updated_at = excluded.updated_at
+            """, (thread_id, blob, ts))
+
+def ensure_state(thread_id: str) -> dict:
+    s = _STATE_CACHE.get(thread_id)
+    if s is None:
+        s = _load(thread_id)
+        if s is None:
+            s = {"session": {"thread_id": thread_id}}
+        _STATE_CACHE[thread_id] = s
+    return s
+
+def update_state(thread_id: str, new_state: dict) -> None:
+    _STATE_CACHE[thread_id] = new_state
+    _save(thread_id, new_state)
+
+def list_threads(limit: int = 100) -> list[dict]:
+    with _CONN_LOCK:
+        with _conn() as c:
+            rows = c.execute(
+                "SELECT thread_id, updated_at FROM session_state ORDER BY updated_at DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+    return [{"thread_id": tid, "updated_at": ts} for (tid, ts) in rows]
+
+# ★ NEW: get_sessions برای /health
+def get_sessions() -> dict[str, dict]:
+    sessions: dict[str, dict] = {}
+    # از DB بخوان
+    with _CONN_LOCK:
+        with _conn() as c:
+            rows = c.execute("SELECT thread_id, state_json FROM session_state").fetchall()
+    for tid, blob in rows:
+        try:
+            sessions[tid] = json.loads(blob)
+        except Exception:
+            pass
+    # کش درون‌حافظه را هم لحاظ کن (آخرین تغییرات هنوز flush نشده؟)
+    sessions.update(_STATE_CACHE)
+    return sessions

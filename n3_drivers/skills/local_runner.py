@@ -61,3 +61,12 @@ def _dev_echo(params: Dict[str, Any]) -> Any:
     return {"echo": params}
 
 register_skill("skill.dev.echo", _dev_echo)
+# --- add reward skill ---
+
+def _dev_reward(params: Dict[str, Any]) -> Any:
+    # params expected: {"score": 0..1, "reason": "..."}
+    score = float(params.get("score", 0.0))
+    reason = str(params.get("reason", ""))
+    return {"reward": {"score": score, "reason": reason}}
+
+register_skill("skill.dev.reward", _dev_reward)
