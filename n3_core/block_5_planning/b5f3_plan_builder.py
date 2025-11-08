@@ -6,7 +6,6 @@ from __future__ import annotations
 import hashlib
 import json
 from typing import Any, Dict, List, Tuple
-
 import unicodedata
 
 __all__ = ["b5f3_build_plan"]
@@ -15,6 +14,16 @@ RULES_VERSION = "1.0"
 
 
 # ------------------------- helpers -------------------------
+
+def _mc_config(inp: Dict[str, Any]):
+    cfg = _get(inp, ["runtime", "config", "guardrails", "must_confirm"], {}) or {}
+    try:
+        u_th = float(cfg.get("u_threshold", 0.8))
+    except Exception:
+        u_th = 0.8
+    rec_req = bool(cfg.get("rec_requires_confirm", False))
+    return u_th, rec_req
+
 
 def _cf(s: str) -> str:
     return unicodedata.normalize("NFC", s).casefold() if isinstance(s, str) else ""
@@ -57,16 +66,21 @@ def _collect_slots(inp: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _packz_text(inp: Dict[str, Any]) -> str:
-    return _get(inp, ["perception", "packz", "text"], "") or _get(inp, ["perception", "normalized_text"], "") or _get(
-        inp, ["text"], "") or ""
+    return (
+        _get(inp, ["perception", "packz", "text"], "")
+        or _get(inp, ["perception", "normalized_text"], "")
+        or _get(inp, ["text"], "")
+        or ""
+    )
 
 
 # ------------------------- plan logic -------------------------
 
 def _confirmation_summary(skill_name: str, filled: Dict[str, Any]) -> str:
-    # Short, safe, language-agnostic confirmation line
-    kv = ", ".join(f"{k}={filled[k]}" for k in sorted(filled.keys()))
-    return f"Confirm to run '{skill_name}' with {kv}"
+    if filled:
+        kv = ", ".join(f"{k}={filled[k]}" for k in sorted(filled.keys()))
+        return f"Confirm to run '{skill_name}' with {kv}"
+    return f"Confirm to run '{skill_name}'"
 
 
 def _question_steps(missing: List[str], questions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -108,29 +122,6 @@ def _ack_step() -> Dict[str, Any]:
 def b5f3_build_plan(input_json: Dict[str, Any]) -> Dict[str, Any]:
     """
     B5F3 — Planning.PlanBuilder (Noema)
-
-    Inputs (best-effort):
-      - planner.intent: { skill_id, skill_name, score, slots{schema[], filled{}, missing[]}, rationale[] }
-      - planner.slot_collect: { filled{}, missing[], questions[], ready: bool, must_confirm: bool }
-      - world_model.uncertainty: { score, recommendation }
-      - world_model.prediction.top
-      - perception.packz.text (optional, for hints)
-
-    Output:
-      {
-        "status": "OK|SKIP|FAIL",
-        "planner": {
-          "plan": {
-            "id": str,
-            "next_move": "ask_user|confirm|execute|answer|ack",
-            "steps": [ { ... } ],
-            "guardrails": { "must_confirm": bool, "uncertainty": float, "recommendation": str },
-            "dry_run_summary": str,
-            "meta": { "source": "B5F3", "rules_version": "1.0" }
-          }
-        },
-        "diag": { "reason": "ok|no_intent" }
-      }
     """
     intent = _collect_intent(input_json)
     if not intent:
@@ -145,25 +136,32 @@ def b5f3_build_plan(input_json: Dict[str, Any]) -> Dict[str, Any]:
 
     u_score, u_rec = _uncertainty(input_json)
     reply_top = _prediction_top(input_json)
+    u_th, rec_req = _mc_config(input_json)
 
     skill_id = str(intent.get("skill_id") or "")
-    skill_name = str(intent.get("skill_name") or "Skill")
+    skill_name = str(intent.get("skill_name") or "Answer Generation")
 
     steps: List[Dict[str, Any]] = []
     next_move = "ask_user"
+    must_confirm = False  # always defined
 
-    # 1) If required slots are missing -> ask user for each missing slot
+    # Force-disable confirm if runtime says so (e.g., /mc u=0.95 rec=off)
+    force_disable_confirm = (u_th >= 0.9) and (rec_req is False)
+
     if missing:
         steps.extend(_question_steps(missing, questions))
         next_move = "ask_user"
     else:
-        # 2) All slots ready
         confirm_summary = _confirmation_summary(skill_name, filled)
-        # Confirmation needed?
-        must_confirm = must_confirm_flag or (reply_top == "execute_action" and u_score >= 0.35) or (
-                    u_rec in {"probe_first", "answer_or_probe"})
-        if skill_id.startswith("skill.answer") or reply_top in {"direct_answer", "acknowledge_only", "small_talk"}:
-            # Answer/ack track
+
+        base_confirm = (
+            must_confirm_flag
+            or (reply_top == "execute_action" and u_score >= u_th)
+            or (rec_req and (u_rec in {"probe_first", "answer_or_probe"}))
+        )
+        must_confirm = False if force_disable_confirm else base_confirm
+
+        if skill_id.startswith("skill.answer") or reply_top in {"direct_answer", "acknowledge_only", "small_talk"} or not skill_id:
             if must_confirm:
                 steps.append({"op": "confirm", "text": confirm_summary, "expects": {"type": "yes_no"}})
                 steps.append(_answer_step(text_hint=_packz_text(input_json)))
@@ -171,8 +169,7 @@ def b5f3_build_plan(input_json: Dict[str, Any]) -> Dict[str, Any]:
             else:
                 steps.append(_answer_step(text_hint=_packz_text(input_json)))
                 next_move = "answer"
-        elif skill_id:
-            # Action track
+        else:
             if must_confirm:
                 steps.append({"op": "confirm", "text": confirm_summary, "expects": {"type": "yes_no"}})
                 steps.append(_execute_step(skill_id, skill_name, filled))
@@ -180,29 +177,7 @@ def b5f3_build_plan(input_json: Dict[str, Any]) -> Dict[str, Any]:
             else:
                 steps.append(_execute_step(skill_id, skill_name, filled))
                 next_move = "execute"
-        else:
-            # Fallback: acknowledge
-            if must_confirm:
-                steps.append({"op": "confirm", "text": confirm_summary, "expects": {"type": "yes_no"}})
-                steps.append(_ack_step())
-                next_move = "confirm"
-            else:
-                steps.append(_ack_step())
-                next_move = "ack"
 
-    # Build plan object
-    plan_core = {
-        "skill_id": skill_id,
-        "skill_name": skill_name,
-        "filled": filled,
-        "missing": missing,
-        "ready": ready,
-        "must_confirm": must_confirm_flag,
-        "uncertainty": round(u_score, 3),
-        "recommendation": u_rec,
-        "reply_top": reply_top,
-        "steps": steps,
-    }
     plan_id = _make_id({"skill_id": skill_id, "filled": filled, "steps": steps})
 
     out = {
@@ -213,13 +188,14 @@ def b5f3_build_plan(input_json: Dict[str, Any]) -> Dict[str, Any]:
                 "next_move": next_move,
                 "steps": steps,
                 "guardrails": {
-                    "must_confirm": bool(must_confirm_flag or (reply_top == "execute_action" and u_score >= 0.35) or (
-                                u_rec in {"probe_first", "answer_or_probe"})),
+                    "must_confirm": bool(must_confirm),
                     "uncertainty": round(u_score, 3),
                     "recommendation": u_rec,
                 },
-                "dry_run_summary": _confirmation_summary(skill_name,
-                                                         filled) if not missing else f"Need slots: {', '.join(missing)}",
+                "dry_run_summary": (
+                    _confirmation_summary(skill_name, filled)
+                    if not missing else f"Need slots: {', '.join(missing)}"
+                ),
                 "meta": {"source": "B5F3", "rules_version": RULES_VERSION},
             }
         },
@@ -229,7 +205,6 @@ def b5f3_build_plan(input_json: Dict[str, Any]) -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
-    # Minimal demo
     sample = {
         "planner": {
             "intent": {
@@ -255,7 +230,7 @@ if __name__ == "__main__":
             "uncertainty": {"score": 0.46, "recommendation": "answer_or_probe"},
             "prediction": {"top": "execute_action"}
         },
-        "perception": {"packz": {"text": "نوما، این لینک رو خلاصه کن: https://example.com/a.pdf"}}
+        "perception": {"packz": {"text": "لطفاً این لینک را خلاصه کن: https://example.com/a.pdf"}}
     }
     res = b5f3_build_plan(sample)
     print(res["planner"]["plan"]["next_move"], len(res["planner"]["plan"]["steps"]),

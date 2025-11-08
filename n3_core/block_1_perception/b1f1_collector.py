@@ -27,7 +27,6 @@ def _last_commit(evs: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
 
 
 def _typing_trace(evs: List[Dict[str, Any]]) -> List[str]:
-    # فقط رد پای شروع/پایان تایپ را نگه می‌دارد
     kinds = {"typing_start": "typing_start", "typing_stop": "typing_stop"}
     trace: List[str] = []
     for e in evs:
@@ -89,7 +88,6 @@ def b1f1_collect(input_json: Dict[str, Any]) -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
-    # نمونهٔ سریع اجرای محلی
     sample = {
         "events": [
             {"type": "typing_start", "t": "."},

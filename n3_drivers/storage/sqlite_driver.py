@@ -1,3 +1,4 @@
+import uuid
 from typing import Any, Dict, List, Tuple, Optional
 import sqlite3
 import json
@@ -125,6 +126,12 @@ def _apply_ops(conn: sqlite3.Connection, ops: List[Dict[str, Any]]) -> int:
             n += 1
     return n
 
+# add at top of file:
+# import uuid
+
+# at top
+import hashlib, uuid
+
 def _index_items(conn: sqlite3.Connection, items: List[Dict[str, Any]]) -> int:
     if not items:
         return 0
@@ -133,30 +140,61 @@ def _index_items(conn: sqlite3.Connection, items: List[Dict[str, Any]]) -> int:
     for it in items:
         if not isinstance(it, dict):
             continue
-        if it.get("type") == "doc" and isinstance(it.get("id"), str) and isinstance(it.get("text"), str):
-            bm25_indexer.index_doc(conn, it["id"], it["text"])
-            n += 1
+        typ = it.get("type")
+        if typ == "doc":
+            if isinstance(it.get("id"), str) and isinstance(it.get("text"), str):
+                bm25_indexer.index_doc(conn, it["id"], it["text"])
+                n += 1
+        elif typ == "packz":
+            # accept either flat fields or nested packz
+            pk = it
+            if "packz" in it and isinstance(it["packz"], dict):
+                pk = it["packz"]
+            pid = pk.get("id") or uuid.uuid4().hex
+            txt = pk.get("text")
+            if isinstance(pid, str) and isinstance(txt, str) and txt.strip():
+                bm25_indexer.index_doc(conn, pid, txt)
+                n += 1
+        elif typ == "fact":
+            # optional: keep facts searchable too
+            k = it.get("k"); v = it.get("v")
+            if isinstance(k, str) and isinstance(v, str):
+                pid = it.get("id") or hashlib.sha1(f"{k}={v}".encode("utf-8")).hexdigest()
+                bm25_indexer.index_doc(conn, pid, f"{k} = {v}")
+                n += 1
     return n
+
+
 
 def apply_index(frame: Dict[str, Any]) -> Dict[str, Any]:
     ns = str(frame.get("namespace") or "store/noema/default")
-    apply_ops = [op for op in (frame.get("apply") or []) if isinstance(op, dict)]
-    index_queue = [it for it in (frame.get("index") or []) if isinstance(it, dict)]
-
     conn = _ensure_conn(ns)
+
+    # قبول هر دو فرمت (list یا dict)
+    apply_field = frame.get("apply") or {}
+    index_field = frame.get("index") or {}
+    if isinstance(apply_field, dict):
+        apply_ops = apply_field.get("ops", [])
+    else:
+        apply_ops = [op for op in apply_field if isinstance(op, dict)]
+    if isinstance(index_field, dict):
+        index_queue = index_field.get("queue", [])
+    else:
+        index_queue = [it for it in index_field if isinstance(it, dict)]
+
     ok = True
+    n_ops = n_idx = 0
     try:
         with conn:
-            n = _apply_ops(conn, apply_ops)
-        idx_n = _index_items(conn, index_queue)
-    except Exception:
+            n_ops = _apply_ops(conn, apply_ops)
+            n_idx = _index_items(conn, index_queue)
+    except Exception as e:
         ok = False
-        n = 0
-        idx_n = 0
+        print("apply_index error:", e)
 
     return {
         "type": "storage",
         "ok": ok,
-        "apply": {"ops": apply_ops[:n] if not ok else apply_ops},
-        "index": {"queue": index_queue[:idx_n] if not ok else index_queue},
+        "apply": {"ops": apply_ops[:n_ops]},
+        "index": {"queue": index_queue[:n_idx]},
     }

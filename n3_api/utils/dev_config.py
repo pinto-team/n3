@@ -3,10 +3,9 @@
 # ================================
 
 def dev_config():
-    """Minimal runtime configuration used by dev sessions."""
     return {
         "guardrails": {
-            "must_confirm": {"u_threshold": 0.4},
+            "must_confirm": {"u_threshold": 0.8, "rec_requires_confirm": False},
             "block_execute_when": {"slo_below": 0.0},
             "latency_soft_limit_ms": 1500,
             "index_queue_soft_max": 1000

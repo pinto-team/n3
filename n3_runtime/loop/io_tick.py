@@ -13,7 +13,10 @@ ORDER = [
     "b11f1_activate_config","b11f2_gatekeeper","b11f3_schedule_runtime",
     "b11f4_initiative_scheduler",                 # <-- new
     "b12f1_orchestrate","b12f2_envelope_actions","b12f3_build_jobs",
-    "b13f1_build_protocol"
+    "b13f1_build_protocol",
+    "b13f2_normalize_driver_replies",
+    "b13f3_plan_retry",
+    "b8f1_memory_commit"
 ]
 
 def _inject_clock(s: Dict[str, Any]) -> Dict[str, Any]:
