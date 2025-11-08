@@ -5,11 +5,11 @@ import os
 from pathlib import Path
 
 # تنظیمات اولیه
-ROOT = Path(r"C:\noema\noema\n3_core")     # مسیر اصلی پروژه
+ROOT = Path(r"D:\noema")     # مسیر اصلی پروژه
 OUTPUT_COMBINED = ROOT / "combined_all.py"     # فایل خروجی کمباین
 OUTPUT_TREE = ROOT / "tree_structure.txt"      # فایل خروجی درخت
 
-IGNORED_DIRS = {"__pycache__"}
+IGNORED_DIRS = {"__pycache__", ".pytest_cache", ".git" , ".idea", ".pytest_cache" ".venv", "docs:"}
 IGNORED_FILES = {"__init__.py"}
 
 # -------------------------------
