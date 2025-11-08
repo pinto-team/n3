@@ -179,6 +179,9 @@ def b5f3_build_plan(input_json: Dict[str, Any]) -> Dict[str, Any]:
                 next_move = "execute"
 
     plan_id = _make_id({"skill_id": skill_id, "filled": filled, "steps": steps})
+    dry = _confirmation_summary(skill_name, filled) if not missing else f"Need slots: {', '.join(missing)}"
+    if not missing and next_move == "answer":
+        dry = f"Answer with text={_packz_text(input_json)}"
 
     out = {
         "status": "OK",
@@ -192,10 +195,7 @@ def b5f3_build_plan(input_json: Dict[str, Any]) -> Dict[str, Any]:
                     "uncertainty": round(u_score, 3),
                     "recommendation": u_rec,
                 },
-                "dry_run_summary": (
-                    _confirmation_summary(skill_name, filled)
-                    if not missing else f"Need slots: {', '.join(missing)}"
-                ),
+                "dry_run_summary": dry,
                 "meta": {"source": "B5F3", "rules_version": RULES_VERSION},
             }
         },
